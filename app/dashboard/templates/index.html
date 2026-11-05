@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Refund Execution Assurance — Dashboard</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header>
+    <h1>Refund Execution Assurance</h1>
+    <p class="disclaimer">
+      ⚠️ Local simulated receiver — <strong>not</strong> a live payment integration.
+      The verifier reasons only from recorded evidence; receiver ground truth is not visible to it.
+    </p>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2>Run a scenario</h2>
+      <div id="scenarios" class="scenarios"></div>
+      <div class="actions">
+        <button id="btn-verify-ledger">Verify full evidence ledger</button>
+        <span id="ledger-status"></span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Latest scenario result</h2>
+      <div id="result" class="empty">No scenario run yet.</div>
+    </section>
+
+    <section class="card">
+      <h2>Event timeline</h2>
+      <table id="timeline">
+        <thead>
+          <tr><th>#</th><th>Event</th><th>From → To</th><th>Timestamp</th><th>Payload</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
