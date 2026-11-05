@@ -10,23 +10,12 @@ Contract
 
 Terminal classification rules (from evidence ALONE)
 ---------------------------------------------------
-1. If the last terminal-ish event is COMPLETION_CONFIRMED, the event MUST carry
-   ``receiver_response_class == STATUS_TERMINAL_COMPLETED``. Otherwise FAILED.
-2. If the last terminal-ish event is CANCELLATION_CONFIRMED, the event MUST
-   carry ``receiver_response_class == STATUS_TERMINAL_CANCELLED``. Otherwise FAILED.
-3. If the last terminal-ish event is OUTCOME_UNKNOWN, the operation is
-   ``OUTCOME_UNKNOWN``, retry is blocked, reconciliation required.
-4. If there is no terminal-ish event, the operation has not reached a
-   classification; report INCONCLUSIVE with retry_eligible derived from the
-   last state (DISPATCH_REJECTED or ADMISSIBILITY_DENIED → retry safe).
-
-Tamper handling
----------------
-If the hash chain is invalid, the verifier returns FAILED with a
-``chain_invalid`` failed assertion **without attempting to parse event
-payloads**. A tampered payload may be structurally invalid; the verifier
-must not crash on it. Parse failures during valid-chain verification are
-also caught defensively and surfaced as a failed assertion.
+1. COMPLETION_CONFIRMED: must carry STATUS_TERMINAL_COMPLETED.
+2. CANCELLATION_CONFIRMED: must carry STATUS_TERMINAL_CANCELLED.
+3. OUTCOME_UNKNOWN: terminal unknown; retry blocked.
+4. REJECTED_NO_FUNDS: dispatch was safely rejected (REJECTED_* response),
+   or ADMISSIBILITY_DENIED, or RELEASE_REPLAY_ATTEMPTED. No funds moved.
+   Retry is permitted.
 """
 from __future__ import annotations
 
@@ -49,6 +38,9 @@ _TERMINAL_TYPES = (
     EvidenceEventType.COMPLETION_CONFIRMED,
     EvidenceEventType.CANCELLATION_CONFIRMED,
     EvidenceEventType.OUTCOME_UNKNOWN,
+    EvidenceEventType.DISPATCH_REJECTED,
+    EvidenceEventType.ADMISSIBILITY_DENIED,
+    EvidenceEventType.RELEASE_REPLAY_ATTEMPTED,
 )
 
 _RETRY_SAFE_STATES = (
@@ -64,16 +56,12 @@ class IndependentVerifier:
     def __init__(self, ledger: EvidenceLedgerReader) -> None:
         self._ledger = ledger
 
-    # ------------------------------------------------------------------
-
     def verify(self, business_operation_id: str) -> VerificationReport:
         chain_valid = self._ledger.verify_chain()
         raw_rows = self._ledger.read_for_operation(business_operation_id)
         last_seq = int(raw_rows[-1]["_sequence"]) if raw_rows else 0
         last_hash = raw_rows[-1]["_hash"] if raw_rows else None
 
-        # Short-circuit: tampering invalidates everything. Do NOT parse the
-        # (possibly malformed) payloads.
         if not chain_valid:
             return build_report(
                 business_operation_id=business_operation_id,
@@ -104,13 +92,12 @@ class IndependentVerifier:
                 last_event_hash=None,
             )
 
-        # Parse events defensively (chain is valid, so this should succeed).
         events: List[EvidenceEvent] = []
         parse_failures = 0
         for r in raw_rows:
             try:
                 events.append(event_from_row(r))
-            except Exception:  # noqa: BLE001 — a bad event must not crash the verifier
+            except Exception:
                 parse_failures += 1
 
         failed: List[str] = []
@@ -125,7 +112,6 @@ class IndependentVerifier:
         if parse_failures:
             failed.append(f"unparseable_events:{parse_failures}")
 
-        # --- terminal classification from evidence alone ---
         terminal_event = self._find_last_terminal(events)
         terminal_classification: Optional[TerminalClassification] = None
         terminal_assert_failed = False
@@ -147,8 +133,16 @@ class IndependentVerifier:
                     terminal_assert_failed = True
             elif terminal_event.event_type is EvidenceEventType.OUTCOME_UNKNOWN:
                 terminal_classification = TerminalClassification.OUTCOME_UNKNOWN
+            elif terminal_event.event_type is EvidenceEventType.DISPATCH_REJECTED:
+                if terminal_event.receiver_response_class is not None and \
+                   terminal_event.receiver_response_class.name.startswith("REJECTED_"):
+                    terminal_classification = TerminalClassification.REJECTED_NO_FUNDS
+                else:
+                    failed.append("dispatch_rejected_without_valid_receiver_rejection_evidence")
+                    terminal_assert_failed = True
+            elif terminal_event.event_type in (EvidenceEventType.ADMISSIBILITY_DENIED, EvidenceEventType.RELEASE_REPLAY_ATTEMPTED):
+                terminal_classification = TerminalClassification.REJECTED_NO_FUNDS
 
-        # --- retry / reconciliation ---
         unresolved: List[str] = []
         if terminal_classification is TerminalClassification.COMPLETION_CONFIRMED:
             retry_eligible = False
@@ -161,6 +155,10 @@ class IndependentVerifier:
             retry_eligible = False
             reconciliation_required = True
             unresolved.append("terminal outcome could not be independently established")
+        elif terminal_classification is TerminalClassification.REJECTED_NO_FUNDS:
+            retry_eligible = True
+            reconciliation_required = False
+            warnings.append("dispatch was safely rejected; no funds moved")
         else:
             last_state = self._infer_last_state(events)
             retry_eligible = last_state in _RETRY_SAFE_STATES
@@ -170,12 +168,12 @@ class IndependentVerifier:
             else:
                 unresolved.append(f"last state {last_state.value} requires further evidence")
 
-        # --- status ---
         if failed or terminal_assert_failed:
             status = VerificationStatus.FAILED
         elif terminal_classification in (
             TerminalClassification.COMPLETION_CONFIRMED,
             TerminalClassification.CANCELLATION_CONFIRMED,
+            TerminalClassification.REJECTED_NO_FUNDS,
         ):
             status = VerificationStatus.VERIFIED
         else:
@@ -195,8 +193,6 @@ class IndependentVerifier:
             last_event_sequence=last_seq,
             last_event_hash=last_hash,
         )
-
-    # ------------------------------------------------------------------
 
     def verify_ledger(self) -> Tuple[bool, int]:
         return self._ledger.verify_chain(), len(self._ledger.read_all())

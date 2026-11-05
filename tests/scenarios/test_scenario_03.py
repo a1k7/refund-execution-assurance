@@ -1,7 +1,12 @@
 """Scenario 3 — Revocation between connector's check and receiver's acceptance."""
 from __future__ import annotations
 
-from app.domain.enums import OperationState, ReceiverResponseClass
+from app.domain.enums import (
+    OperationState,
+    ReceiverResponseClass,
+    TerminalClassification,
+    VerificationStatus,
+)
 from app.connector.hooks import DispatchContext
 
 
@@ -31,3 +36,11 @@ def test_revocation_between_check_and_acceptance_is_fenced(world) -> None:
     assert types.count("RELEASE_CONSUMED") == 1
     assert types.count("AUTHORITY_REVOKED") == 1
     assert "DISPATCH_REJECTED" in types
+
+    # Verifier must establish safe rejection, confirm no funds moved, and mark it retry eligible.
+    report = world.verifier.verify(bo)
+    assert report.verification_status is VerificationStatus.VERIFIED
+    assert report.terminal_classification is TerminalClassification.REJECTED_NO_FUNDS
+    assert report.retry_eligible is True
+    assert report.reconciliation_required is False
+    assert not report.failed_assertions

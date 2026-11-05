@@ -49,7 +49,6 @@ def assert_events_have_ascending_timestamps(events: Sequence[EvidenceEvent]) -> 
 
 
 def assert_release_verified_before_dispatch(events: Sequence[EvidenceEvent]) -> Optional[str]:
-    """Any DISPATCH_ATTEMPTED for an attempt must be preceded by RELEASE_VERIFIED for that release_id."""
     verified_ids = {
         e.release_id
         for e in events
@@ -63,7 +62,6 @@ def assert_release_verified_before_dispatch(events: Sequence[EvidenceEvent]) -> 
 
 
 def assert_release_consumed_before_dispatch_attempted(events: Sequence[EvidenceEvent]) -> Optional[str]:
-    """Any DISPATCH_ACCEPTED/REJECTED must be preceded by RELEASE_CONSUMED for the same release_id."""
     consumed_ids = {
         e.release_id
         for e in events
@@ -80,7 +78,6 @@ def assert_release_consumed_before_dispatch_attempted(events: Sequence[EvidenceE
 
 
 def assert_cancellation_confirmed_has_terminal_cancelled(events: Sequence[EvidenceEvent]) -> Optional[str]:
-    """A CANCELLATION_CONFIRMED event must be backed by STATUS_TERMINAL_CANCELLED evidence."""
     for e in events:
         if e.event_type is EvidenceEventType.CANCELLATION_CONFIRMED:
             if e.receiver_response_class is not ReceiverResponseClass.STATUS_TERMINAL_CANCELLED:
@@ -89,7 +86,6 @@ def assert_cancellation_confirmed_has_terminal_cancelled(events: Sequence[Eviden
 
 
 def assert_completion_confirmed_has_terminal_completed(events: Sequence[EvidenceEvent]) -> Optional[str]:
-    """A COMPLETION_CONFIRMED event must be backed by STATUS_TERMINAL_COMPLETED evidence."""
     for e in events:
         if e.event_type is EvidenceEventType.COMPLETION_CONFIRMED:
             if e.receiver_response_class is not ReceiverResponseClass.STATUS_TERMINAL_COMPLETED:
@@ -98,13 +94,21 @@ def assert_completion_confirmed_has_terminal_completed(events: Sequence[Evidence
 
 
 def assert_cancellation_ack_not_treated_as_confirmed(events: Sequence[EvidenceEvent]) -> Optional[str]:
-    """A CANCELLATION_ACKNOWLEDGED event must not be promoted to CONFIRMED without status evidence."""
     acked = any(e.event_type is EvidenceEventType.CANCELLATION_ACKNOWLEDGED for e in events)
     confirmed = any(e.event_type is EvidenceEventType.CANCELLATION_CONFIRMED for e in events)
     if confirmed and not acked:
-        # Confirmed without ack is legal only if a direct status query was used (single event).
-        # We allow it: the status query itself is the terminal evidence.
         return None
+    return None
+
+
+def assert_dispatch_rejected_has_valid_response(events: Sequence[EvidenceEvent]) -> Optional[str]:
+    """A DISPATCH_REJECTED event must carry a REJECTED_* receiver response class."""
+    for e in events:
+        if e.event_type is EvidenceEventType.DISPATCH_REJECTED:
+            if e.receiver_response_class is None:
+                return f"DISPATCH_REJECTED event {e.event_id} missing receiver_response_class"
+            if not e.receiver_response_class.name.startswith("REJECTED_"):
+                return f"DISPATCH_REJECTED event {e.event_id} has invalid response {e.receiver_response_class.name}"
     return None
 
 
@@ -112,8 +116,6 @@ def assert_cancellation_ack_not_treated_as_confirmed(events: Sequence[EvidenceEv
 
 
 def assert_retries_justified(events: Sequence[EvidenceEvent]) -> Optional[str]:
-    """A new DISPATCH_ATTEMPTED may only occur if prior attempts are non-terminal or documented as safe."""
-    # Count attempts per release_id. Each release can only be dispatched once.
     attempts_per_release: dict[str, int] = {}
     for e in events:
         if e.event_type is EvidenceEventType.DISPATCH_ATTEMPTED and e.release_id is not None:
@@ -136,6 +138,7 @@ ALL_ASSERTIONS = (
     ("cancellation_confirmed_has_terminal_cancelled", lambda evs, ctx: assert_cancellation_confirmed_has_terminal_cancelled(evs)),
     ("completion_confirmed_has_terminal_completed", lambda evs, ctx: assert_completion_confirmed_has_terminal_completed(evs)),
     ("cancellation_ack_not_confirmed_without_status", lambda evs, ctx: assert_cancellation_ack_not_treated_as_confirmed(evs)),
+    ("dispatch_rejected_has_valid_response", lambda evs, ctx: assert_dispatch_rejected_has_valid_response(evs)),
     ("retries_justified", lambda evs, ctx: assert_retries_justified(evs)),
 )
 

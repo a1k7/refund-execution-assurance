@@ -132,3 +132,39 @@ def test_verify_ledger_returns_tuple(world) -> None:
     ok, count = world.verifier.verify_ledger()
     assert ok is True
     assert count == len(world.ledger.read_all())
+
+
+def test_forged_dispatch_rejected_fails(world) -> None:
+    """A forged DISPATCH_REJECTED without a valid response class must FAIL verification."""
+    bo = world.create_operation()
+    world.ledger.append(build_event(
+        event_type=EvidenceEventType.DISPATCH_REJECTED,
+        evidence_source="test",
+        timestamp=world.clock.now(),
+        business_operation_id=bo,
+        previous_state=OperationState.DISPATCH_ATTEMPTED,
+        new_state=OperationState.DISPATCH_REJECTED,
+        receiver_response_class=None,  # Forged / incomplete
+    ))
+    report = world.verifier.verify(bo)
+    assert report.verification_status is VerificationStatus.FAILED
+    assert any("dispatch_rejected_without_valid_receiver_rejection_evidence" in f for f in report.failed_assertions)
+    assert any("dispatch_rejected_has_valid_response" in f for f in report.failed_assertions)
+
+
+def test_admissibility_denied_is_verified_as_rejected(world) -> None:
+    """ADMISSIBILITY_DENIED is a safe local rejection; verifier must classify it as REJECTED_NO_FUNDS."""
+    bo = world.create_operation()
+    world.ledger.append(build_event(
+        event_type=EvidenceEventType.ADMISSIBILITY_DENIED,
+        evidence_source="test",
+        timestamp=world.clock.now(),
+        business_operation_id=bo,
+        previous_state=OperationState.RELEASE_VERIFIED,
+        new_state=OperationState.ADMISSIBILITY_DENIED,
+        receiver_response_class=None,
+    ))
+    report = world.verifier.verify(bo)
+    assert report.verification_status is VerificationStatus.VERIFIED
+    assert report.terminal_classification is TerminalClassification.REJECTED_NO_FUNDS
+    assert report.retry_eligible is True
