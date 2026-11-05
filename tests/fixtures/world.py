@@ -29,6 +29,7 @@ from app.domain.enums import (
 )
 from app.domain.ids import new_business_operation_id, new_correlation_id
 from app.domain.models import SignedRelease
+from app.domain.state_machine import assert_transition
 from app.evidence.ledger import EvidenceLedger
 from app.evidence.schema import build_event
 from app.persistence.db import Database
@@ -123,7 +124,9 @@ class World:
             valid_for_seconds=valid_for_seconds,
         )
         ReleaseRepository(self.db).insert(signed, self.clock.now())
-        if op.state is OperationState.CREATED:
+        # UPDATE: Match API logic to transition from rejected/denied states back to ISSUED
+        if op.state in (OperationState.CREATED, OperationState.ADMISSIBILITY_DENIED, OperationState.DISPATCH_REJECTED):
+            assert_transition(op.state, OperationState.RELEASE_ISSUED, reason="fixture-issue")
             self.operations.update_state(
                 business_operation_id, OperationState.RELEASE_ISSUED, self.clock.now()
             )

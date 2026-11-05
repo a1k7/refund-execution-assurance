@@ -13,9 +13,11 @@ Terminal classification rules (from evidence ALONE)
 1. COMPLETION_CONFIRMED: must carry STATUS_TERMINAL_COMPLETED.
 2. CANCELLATION_CONFIRMED: must carry STATUS_TERMINAL_CANCELLED.
 3. OUTCOME_UNKNOWN: terminal unknown; retry blocked.
-4. REJECTED_NO_FUNDS: dispatch was safely rejected (REJECTED_* response),
-   or ADMISSIBILITY_DENIED, or RELEASE_REPLAY_ATTEMPTED. No funds moved.
-   Retry is permitted.
+4. REJECTED_STALE_AUTHORITY: dispatch was safely rejected due to fencing or
+   local admissibility denial. No funds moved. Retry permitted with new release.
+5. REJECTED_NO_FUNDS: dispatch was rejected by the receiver (invalid/duplicate).
+   No funds moved. Retry permitted.
+6. REJECTED_REPLAY: release replay was detected by atomic consumption.
 """
 from __future__ import annotations
 
@@ -24,6 +26,7 @@ from typing import List, Optional, Tuple
 from ..domain.enums import (
     EvidenceEventType,
     OperationState,
+    ReceiverResponseClass,
     TerminalClassification,
     VerificationStatus,
 )
@@ -134,14 +137,21 @@ class IndependentVerifier:
             elif terminal_event.event_type is EvidenceEventType.OUTCOME_UNKNOWN:
                 terminal_classification = TerminalClassification.OUTCOME_UNKNOWN
             elif terminal_event.event_type is EvidenceEventType.DISPATCH_REJECTED:
-                if terminal_event.receiver_response_class is not None and \
-                   terminal_event.receiver_response_class.name.startswith("REJECTED_"):
-                    terminal_classification = TerminalClassification.REJECTED_NO_FUNDS
+                if terminal_event.receiver_response_class is not None:
+                    if terminal_event.receiver_response_class == ReceiverResponseClass.REJECTED_FENCED:
+                        terminal_classification = TerminalClassification.REJECTED_STALE_AUTHORITY
+                    elif terminal_event.receiver_response_class.name.startswith("REJECTED_"):
+                        terminal_classification = TerminalClassification.REJECTED_NO_FUNDS
+                    else:
+                        failed.append("dispatch_rejected_with_invalid_receiver_evidence")
+                        terminal_assert_failed = True
                 else:
                     failed.append("dispatch_rejected_without_valid_receiver_rejection_evidence")
                     terminal_assert_failed = True
-            elif terminal_event.event_type in (EvidenceEventType.ADMISSIBILITY_DENIED, EvidenceEventType.RELEASE_REPLAY_ATTEMPTED):
-                terminal_classification = TerminalClassification.REJECTED_NO_FUNDS
+            elif terminal_event.event_type is EvidenceEventType.ADMISSIBILITY_DENIED:
+                terminal_classification = TerminalClassification.REJECTED_STALE_AUTHORITY
+            elif terminal_event.event_type is EvidenceEventType.RELEASE_REPLAY_ATTEMPTED:
+                terminal_classification = TerminalClassification.REJECTED_REPLAY
 
         unresolved: List[str] = []
         if terminal_classification is TerminalClassification.COMPLETION_CONFIRMED:
@@ -155,7 +165,11 @@ class IndependentVerifier:
             retry_eligible = False
             reconciliation_required = True
             unresolved.append("terminal outcome could not be independently established")
-        elif terminal_classification is TerminalClassification.REJECTED_NO_FUNDS:
+        elif terminal_classification in (
+            TerminalClassification.REJECTED_NO_FUNDS,
+            TerminalClassification.REJECTED_STALE_AUTHORITY,
+            TerminalClassification.REJECTED_REPLAY,
+        ):
             retry_eligible = True
             reconciliation_required = False
             warnings.append("dispatch was safely rejected; no funds moved")
@@ -174,6 +188,8 @@ class IndependentVerifier:
             TerminalClassification.COMPLETION_CONFIRMED,
             TerminalClassification.CANCELLATION_CONFIRMED,
             TerminalClassification.REJECTED_NO_FUNDS,
+            TerminalClassification.REJECTED_STALE_AUTHORITY,
+            TerminalClassification.REJECTED_REPLAY,
         ):
             status = VerificationStatus.VERIFIED
         else:

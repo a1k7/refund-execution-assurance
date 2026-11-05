@@ -14,7 +14,6 @@ from app.receiver.simulated import SimulatedReceiverBehaviour
 
 def test_no_evidence_yields_inconclusive(world) -> None:
     bo = world.create_operation()
-    # Clear the OPERATION_CREATED event we made for a truly empty ledger.
     with world.db.transaction() as c:
         c.execute("DELETE FROM evidence WHERE business_operation_id = ?", (bo,))
     report = world.verifier.verify(bo)
@@ -31,7 +30,6 @@ def test_completion_with_terminal_evidence_verifies(world) -> None:
         world.coordinator.dispatch(
             business_operation_id=bo, release=signed, idempotency_key="idem_1"
         )
-        # Now query status to record terminal completion evidence.
         world.cancellation.confirm_from_status(bo)
         report = world.verifier.verify(bo)
         assert report.verification_status is VerificationStatus.VERIFIED
@@ -75,7 +73,6 @@ def test_outcome_unknown_is_not_treated_as_terminal_success(world) -> None:
 
 
 def test_completion_confirmed_without_terminal_class_fails(world) -> None:
-    """A COMPLETION_CONFIRMED event lacking STATUS_TERMINAL_COMPLETED is a verification failure."""
     bo = world.create_operation()
     world.ledger.append(build_event(
         event_type=EvidenceEventType.COMPLETION_CONFIRMED,
@@ -84,7 +81,7 @@ def test_completion_confirmed_without_terminal_class_fails(world) -> None:
         business_operation_id=bo,
         previous_state=OperationState.IN_FLIGHT,
         new_state=OperationState.COMPLETION_CONFIRMED,
-        receiver_response_class=None,  # deliberately omitted
+        receiver_response_class=None,
     ))
     report = world.verifier.verify(bo)
     assert report.verification_status is VerificationStatus.FAILED
@@ -117,7 +114,6 @@ def test_tampered_ledger_causes_failure(world) -> None:
         previous_state=OperationState.RELEASE_CONSUMED,
         new_state=OperationState.DISPATCH_ATTEMPTED,
     ))
-    # Tamper event_json
     with world.db.transaction() as c:
         c.execute(
             "UPDATE evidence SET event_json = '{\"tampered\":true}' WHERE business_operation_id = ?",
@@ -144,7 +140,7 @@ def test_forged_dispatch_rejected_fails(world) -> None:
         business_operation_id=bo,
         previous_state=OperationState.DISPATCH_ATTEMPTED,
         new_state=OperationState.DISPATCH_REJECTED,
-        receiver_response_class=None,  # Forged / incomplete
+        receiver_response_class=None,
     ))
     report = world.verifier.verify(bo)
     assert report.verification_status is VerificationStatus.FAILED
@@ -152,8 +148,43 @@ def test_forged_dispatch_rejected_fails(world) -> None:
     assert any("dispatch_rejected_has_valid_response" in f for f in report.failed_assertions)
 
 
-def test_admissibility_denied_is_verified_as_rejected(world) -> None:
-    """ADMISSIBILITY_DENIED is a safe local rejection; verifier must classify it as REJECTED_NO_FUNDS."""
+def test_fenced_rejection_is_stale_authority(world) -> None:
+    """Proves that REJECTED_FENCED maps to REJECTED_STALE_AUTHORITY, not REJECTED_NO_FUNDS."""
+    bo = world.create_operation()
+    world.ledger.append(build_event(
+        event_type=EvidenceEventType.DISPATCH_REJECTED,
+        evidence_source="test",
+        timestamp=world.clock.now(),
+        business_operation_id=bo,
+        previous_state=OperationState.DISPATCH_ATTEMPTED,
+        new_state=OperationState.DISPATCH_REJECTED,
+        receiver_response_class=ReceiverResponseClass.REJECTED_FENCED,
+    ))
+    report = world.verifier.verify(bo)
+    assert report.verification_status is VerificationStatus.VERIFIED
+    assert report.terminal_classification is TerminalClassification.REJECTED_STALE_AUTHORITY
+    assert report.terminal_classification is not TerminalClassification.REJECTED_NO_FUNDS
+
+
+def test_invalid_rejection_is_no_funds(world) -> None:
+    """Proves that REJECTED_INVALID maps to REJECTED_NO_FUNDS."""
+    bo = world.create_operation()
+    world.ledger.append(build_event(
+        event_type=EvidenceEventType.DISPATCH_REJECTED,
+        evidence_source="test",
+        timestamp=world.clock.now(),
+        business_operation_id=bo,
+        previous_state=OperationState.DISPATCH_ATTEMPTED,
+        new_state=OperationState.DISPATCH_REJECTED,
+        receiver_response_class=ReceiverResponseClass.REJECTED_INVALID,
+    ))
+    report = world.verifier.verify(bo)
+    assert report.verification_status is VerificationStatus.VERIFIED
+    assert report.terminal_classification is TerminalClassification.REJECTED_NO_FUNDS
+
+
+def test_admissibility_denied_is_verified_as_stale_authority(world) -> None:
+    """ADMISSIBILITY_DENIED is a safe local rejection; verifier must classify it as REJECTED_STALE_AUTHORITY."""
     bo = world.create_operation()
     world.ledger.append(build_event(
         event_type=EvidenceEventType.ADMISSIBILITY_DENIED,
@@ -166,5 +197,5 @@ def test_admissibility_denied_is_verified_as_rejected(world) -> None:
     ))
     report = world.verifier.verify(bo)
     assert report.verification_status is VerificationStatus.VERIFIED
-    assert report.terminal_classification is TerminalClassification.REJECTED_NO_FUNDS
+    assert report.terminal_classification is TerminalClassification.REJECTED_STALE_AUTHORITY
     assert report.retry_eligible is True
