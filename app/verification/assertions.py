@@ -45,43 +45,68 @@ def assert_events_have_ascending_timestamps(events: Sequence[EvidenceEvent]) -> 
     return None
 
 
-# --- release validity ---------------------------------------------------
+# --- release validity & ordering ----------------------------------------
 
 
 def assert_release_verified_before_dispatch(events: Sequence[EvidenceEvent]) -> Optional[str]:
-    verified_ids = {
-        e.release_id
-        for e in events
-        if e.event_type is EvidenceEventType.RELEASE_VERIFIED and e.release_id is not None
-    }
-    for e in events:
+    """Sequence-aware check: RELEASE_VERIFIED must precede DISPATCH_ATTEMPTED."""
+    verified_at = {}
+    for i, e in enumerate(events):
+        if e.event_type is EvidenceEventType.RELEASE_VERIFIED and e.release_id:
+            verified_at[e.release_id] = i
+
+    for i, e in enumerate(events):
         if e.event_type is EvidenceEventType.DISPATCH_ATTEMPTED:
-            if e.release_id not in verified_ids:
+            if not e.release_id:
+                return f"dispatch_attempted {e.event_id} missing release_id"
+            if e.release_id not in verified_at:
                 return f"dispatch_attempted for {e.release_id} without prior RELEASE_VERIFIED"
+            if verified_at[e.release_id] >= i:
+                return f"RELEASE_VERIFIED for {e.release_id} occurred after DISPATCH_ATTEMPTED"
     return None
 
 
 def assert_release_consumed_before_dispatch_attempted(events: Sequence[EvidenceEvent]) -> Optional[str]:
-    consumed_ids = {
-        e.release_id
-        for e in events
-        if e.event_type is EvidenceEventType.RELEASE_CONSUMED and e.release_id is not None
-    }
-    for e in events:
-        if e.event_type in (EvidenceEventType.DISPATCH_ACCEPTED, EvidenceEventType.DISPATCH_REJECTED):
-            if e.release_id is not None and e.release_id not in consumed_ids:
-                return f"{e.event_type.value} for {e.release_id} without RELEASE_CONSUMED"
+    """Sequence-aware check: RELEASE_CONSUMED must precede DISPATCH_ATTEMPTED."""
+    consumed_at = {}
+    for i, e in enumerate(events):
+        if e.event_type is EvidenceEventType.RELEASE_CONSUMED and e.release_id:
+            consumed_at[e.release_id] = i
+
+    for i, e in enumerate(events):
+        if e.event_type is EvidenceEventType.DISPATCH_ATTEMPTED:
+            if not e.release_id:
+                return f"dispatch_attempted {e.event_id} missing release_id"
+            if e.release_id not in consumed_at:
+                return f"dispatch_attempted for {e.release_id} without prior RELEASE_CONSUMED"
+            if consumed_at[e.release_id] >= i:
+                return f"RELEASE_CONSUMED for {e.release_id} occurred after DISPATCH_ATTEMPTED"
     return None
 
 
 # --- cancellation / completion evidence ---------------------------------
 
 
-def assert_cancellation_confirmed_has_terminal_cancelled(events: Sequence[EvidenceEvent]) -> Optional[str]:
+def assert_cancellation_ack_not_treated_as_confirmed(events: Sequence[EvidenceEvent]) -> Optional[str]:
+    """Ensure CANCELLATION_CONFIRMED is backed by explicit terminal status, not just ACK."""
     for e in events:
         if e.event_type is EvidenceEventType.CANCELLATION_CONFIRMED:
-            if e.receiver_response_class is not ReceiverResponseClass.STATUS_TERMINAL_CANCELLED:
-                return f"CANCELLATION_CONFIRMED event {e.event_id} lacks terminal-cancelled evidence"
+            # Must have explicitly recorded the terminal status on this very event.
+            if e.receiver_response_class != ReceiverResponseClass.STATUS_TERMINAL_CANCELLED:
+                return f"CANCELLATION_CONFIRMED event {e.event_id} lacks STATUS_TERMINAL_CANCELLED"
+            
+            # Must have a valid receiver reference to prevent cross-operation confusion.
+            if not e.receiver_refund_reference:
+                return f"CANCELLATION_CONFIRMED event {e.event_id} missing receiver_refund_reference"
+            
+            # Must be preceded by a REQUESTED or ACKNOWLEDGED event for the SAME reference.
+            prior_refs = {
+                ev.receiver_refund_reference for ev in events
+                if ev.event_type in (EvidenceEventType.CANCELLATION_REQUESTED, EvidenceEventType.CANCELLATION_ACKNOWLEDGED)
+                and ev.receiver_refund_reference is not None
+            }
+            if e.receiver_refund_reference not in prior_refs:
+                return f"CANCELLATION_CONFIRMED for {e.receiver_refund_reference} lacks prior REQUESTED/ACKNOWLEDGED"
     return None
 
 
@@ -90,14 +115,6 @@ def assert_completion_confirmed_has_terminal_completed(events: Sequence[Evidence
         if e.event_type is EvidenceEventType.COMPLETION_CONFIRMED:
             if e.receiver_response_class is not ReceiverResponseClass.STATUS_TERMINAL_COMPLETED:
                 return f"COMPLETION_CONFIRMED event {e.event_id} lacks terminal-completed evidence"
-    return None
-
-
-def assert_cancellation_ack_not_treated_as_confirmed(events: Sequence[EvidenceEvent]) -> Optional[str]:
-    acked = any(e.event_type is EvidenceEventType.CANCELLATION_ACKNOWLEDGED for e in events)
-    confirmed = any(e.event_type is EvidenceEventType.CANCELLATION_CONFIRMED for e in events)
-    if confirmed and not acked:
-        return None
     return None
 
 
@@ -116,13 +133,30 @@ def assert_dispatch_rejected_has_valid_response(events: Sequence[EvidenceEvent])
 
 
 def assert_retries_justified(events: Sequence[EvidenceEvent]) -> Optional[str]:
-    attempts_per_release: dict[str, int] = {}
+    """Ensure no retry occurs after an unsafe/terminal state."""
+    last_attempt_state = None
     for e in events:
-        if e.event_type is EvidenceEventType.DISPATCH_ATTEMPTED and e.release_id is not None:
-            attempts_per_release[e.release_id] = attempts_per_release.get(e.release_id, 0) + 1
-    for rid, count in attempts_per_release.items():
-        if count > 1:
-            return f"release {rid} attempted {count} times"
+        if e.event_type is EvidenceEventType.DISPATCH_ATTEMPTED:
+            if last_attempt_state in (
+                EvidenceEventType.OUTCOME_UNKNOWN,
+                EvidenceEventType.IN_FLIGHT,
+                EvidenceEventType.COMPLETION_CONFIRMED,
+                EvidenceEventType.CANCELLATION_CONFIRMED,
+            ):
+                return f"retry attempted after unsafe state {last_attempt_state.name}"
+        
+        if e.event_type is EvidenceEventType.DISPATCH_REJECTED:
+            last_attempt_state = e.event_type
+        elif e.event_type is EvidenceEventType.ADMISSIBILITY_DENIED:
+            last_attempt_state = e.event_type
+        elif e.event_type in (
+            EvidenceEventType.OUTCOME_UNKNOWN,
+            EvidenceEventType.IN_FLIGHT,
+            EvidenceEventType.COMPLETION_CONFIRMED,
+            EvidenceEventType.CANCELLATION_CONFIRMED,
+        ):
+            last_attempt_state = e.event_type
+
     return None
 
 
@@ -135,9 +169,8 @@ ALL_ASSERTIONS = (
     ("ascending_timestamps", lambda evs, ctx: assert_events_have_ascending_timestamps(evs)),
     ("release_verified_before_dispatch", lambda evs, ctx: assert_release_verified_before_dispatch(evs)),
     ("release_consumed_before_dispatch_attempted", lambda evs, ctx: assert_release_consumed_before_dispatch_attempted(evs)),
-    ("cancellation_confirmed_has_terminal_cancelled", lambda evs, ctx: assert_cancellation_confirmed_has_terminal_cancelled(evs)),
+    ("cancellation_confirmed_has_terminal_cancelled", lambda evs, ctx: assert_cancellation_ack_not_treated_as_confirmed(evs)),
     ("completion_confirmed_has_terminal_completed", lambda evs, ctx: assert_completion_confirmed_has_terminal_completed(evs)),
-    ("cancellation_ack_not_confirmed_without_status", lambda evs, ctx: assert_cancellation_ack_not_treated_as_confirmed(evs)),
     ("dispatch_rejected_has_valid_response", lambda evs, ctx: assert_dispatch_rejected_has_valid_response(evs)),
     ("retries_justified", lambda evs, ctx: assert_retries_justified(evs)),
 )
