@@ -88,7 +88,9 @@ class EvidenceLedger:
 
 def event_from_row(row: Dict[str, Any]) -> EvidenceEvent:
     payload = {k: v for k, v in row.items() if not k.startswith("_")}
-    return from_storage_payload(payload)
+    event = from_storage_payload(payload)
+    event.sequence = row.get("_sequence")
+    return event
 
 
 __all__ = ["EvidenceLedger", "event_from_row"]

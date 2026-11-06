@@ -130,6 +130,7 @@ class EvidenceEvent(BaseModel):
     payload_digest: Optional[str] = None
     payload: Optional[Dict[str, Any]] = None
     correlation_id: Optional[str] = None
+    sequence: Optional[int] = None
 
 
 class VerificationReport(BaseModel):
