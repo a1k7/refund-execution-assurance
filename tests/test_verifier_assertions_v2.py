@@ -8,7 +8,7 @@ from app.domain.enums import (
 )
 from app.domain.models import EvidenceEvent
 from app.verification.assertions import (
-    assert_cancellation_ack_not_treated_as_confirmed,
+    assert_cancellation_confirmed_has_terminal_evidence,
     assert_release_verified_before_dispatch,
     assert_release_consumed_before_dispatch_attempted,
     assert_retries_justified,
@@ -37,21 +37,21 @@ def test_cancellation_confirmation_cannot_precede_ack():
         _ev(EvidenceEventType.CANCELLATION_CONFIRMED, state=OperationState.CANCELLATION_CONFIRMED, resp=ReceiverResponseClass.STATUS_TERMINAL_CANCELLED),
         _ev(EvidenceEventType.CANCELLATION_ACKNOWLEDGED),
     ]
-    assert assert_cancellation_ack_not_treated_as_confirmed(events) is not None
+    assert assert_cancellation_confirmed_has_terminal_evidence(events) is not None
 
 def test_cancellation_cross_operation_fails():
     events = [
         _ev(EvidenceEventType.CANCELLATION_REQUESTED, op_id="bo_1"),
         _ev(EvidenceEventType.CANCELLATION_CONFIRMED, op_id="bo_2", state=OperationState.CANCELLATION_CONFIRMED, resp=ReceiverResponseClass.STATUS_TERMINAL_CANCELLED),
     ]
-    assert assert_cancellation_ack_not_treated_as_confirmed(events) is not None
+    assert assert_cancellation_confirmed_has_terminal_evidence(events) is not None
 
 def test_cancellation_wrong_attempt_fails():
     events = [
         _ev(EvidenceEventType.CANCELLATION_REQUESTED, att_id="att_1"),
         _ev(EvidenceEventType.CANCELLATION_CONFIRMED, att_id="att_2", state=OperationState.CANCELLATION_CONFIRMED, resp=ReceiverResponseClass.STATUS_TERMINAL_CANCELLED),
     ]
-    assert assert_cancellation_ack_not_treated_as_confirmed(events) is not None
+    assert assert_cancellation_confirmed_has_terminal_evidence(events) is not None
 
 # --- Finding 2: Attempt-Specific Ordering ---
 def test_release_verified_for_wrong_attempt_fails():

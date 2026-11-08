@@ -7,7 +7,7 @@ from app.domain.enums import (
 )
 from app.domain.models import EvidenceEvent
 from app.verification.assertions import (
-    assert_cancellation_ack_not_treated_as_confirmed,
+    assert_cancellation_confirmed_has_terminal_evidence,
     assert_release_verified_before_dispatch,
     assert_release_consumed_before_dispatch_attempted,
     assert_retries_justified,
@@ -36,7 +36,7 @@ def test_ack_alone_does_not_confirm():
         _ev(EvidenceEventType.CANCELLATION_CONFIRMED, state=OperationState.CANCELLATION_CONFIRMED, resp=None, ref="ref_1"),
     ]
     # Must fail because it lacks STATUS_TERMINAL_CANCELLED
-    assert assert_cancellation_ack_not_treated_as_confirmed(events) is not None
+    assert assert_cancellation_confirmed_has_terminal_evidence(events) is not None
 
 def test_confirmed_with_terminal_evidence_passes():
     events = [
@@ -44,7 +44,7 @@ def test_confirmed_with_terminal_evidence_passes():
         _ev(EvidenceEventType.CANCELLATION_ACKNOWLEDGED, ref="ref_1"),
         _ev(EvidenceEventType.CANCELLATION_CONFIRMED, state=OperationState.CANCELLATION_CONFIRMED, resp=ReceiverResponseClass.STATUS_TERMINAL_CANCELLED, ref="ref_1"),
     ]
-    assert assert_cancellation_ack_not_treated_as_confirmed(events) is None
+    assert assert_cancellation_confirmed_has_terminal_evidence(events) is None
 
 def test_confirmed_with_uncorrelated_ref_fails():
     events = [
@@ -53,7 +53,7 @@ def test_confirmed_with_uncorrelated_ref_fails():
         _ev(EvidenceEventType.CANCELLATION_CONFIRMED, state=OperationState.CANCELLATION_CONFIRMED, resp=ReceiverResponseClass.STATUS_TERMINAL_CANCELLED, ref="ref_B"),
     ]
     # Must fail because ref_B was never requested/acknowledged
-    assert assert_cancellation_ack_not_treated_as_confirmed(events) is not None
+    assert assert_cancellation_confirmed_has_terminal_evidence(events) is not None
 
 # --- Finding B: Sequence-Aware Ordering ---
 def test_release_verified_after_dispatch_fails():
