@@ -1,42 +1,5 @@
 """Dispatch coordinator: the one place that drives a refund dispatch end to end.
-
-Concurrency model
------------------
-A per-operation ``threading.Lock`` serializes concurrent ``dispatch()`` calls
-for the same ``business_operation_id``. Without it, atomic release
-consumption would prevent two workers from *consuming* the same release, but
-the two calls would still race on ``operations.state`` transitions and could
-overwrite ``IN_FLIGHT`` with ``RELEASE_CONSUMED``. See ARCHITECTURE.md
-§"Single-process limitations" — in production this requires a distributed
-lock keyed on the operation ID.
-
-Step order (important for evidence)
------------------------------------
-After release verification, the authority gate runs FIRST, then the
-duplicate guard. Rationale:
-  * Revocation is the more important signal. If both would block, we record
-    ``ADMISSIBILITY_DENIED`` with reason ``authority_revoked`` — the honest
-    reason — rather than ``duplicate_guard: BLOCK_IN_FLIGHT``.
-  * The duplicate guard's authority check still exists for direct callers
-    (``/operations/{id}``, ``RetryPolicy``); it is not the coordinator's
-    primary defense here.
-
-Steps (each is recorded as evidence):
-  1. Cryptographically verify the release. Failure -> RELEASE_VERIFICATION_FAILED.
-  2. Transition CREATED/RELEASE_ISSUED -> RELEASE_VERIFIED.
-  3. Authority gate: revoked or stale epoch -> ADMISSIBILITY_DENIED, return.
-  4. Duplicate guard. Non-ALLOW -> RETRY_DECISION, return.
-  5. Transition RELEASE_VERIFIED -> ADMISSIBILITY_ALLOWED.
-  6. Create dispatch attempt; record DISPATCH_ATTEMPTED.
-  7. Atomic consumption. Failure -> RELEASE_REPLAY_ATTEMPTED.
-  8. Transition to RELEASE_CONSUMED then DISPATCH_ATTEMPTED; record RELEASE_CONSUMED.
-  9. Fire before_receiver_call hook (deterministic test injection point).
- 10. Call receiver. Record ``receiver_refund_reference`` on ANY response that
-     carries one (accepted AND inconclusive).
- 11. Handle response:
-       ACCEPTED            -> DISPATCH_ACCEPTED -> IN_FLIGHT
-       REJECTED_*          -> DISPATCH_REJECTED
-       INCONCLUSIVE/ERROR  -> OUTCOME_UNKNOWN (reconciliation_required=True)
+...
 """
 from __future__ import annotations
 
@@ -211,7 +174,7 @@ class DispatchCoordinator:
             )
         )
 
-        # 3. Authority gate FIRST (records ADMISSIBILITY_DENIED with the honest reason).
+        # 3. Authority gate FIRST.
         revoked = self.revocation.is_revoked(business_operation_id)
         stale_epoch = release.payload.release_epoch < op.current_epoch
         if revoked or stale_epoch:
@@ -244,7 +207,7 @@ class DispatchCoordinator:
                 reason=reason,
             )
 
-        # 4. Duplicate guard (authority is known active; only duplicates/in-flight block here).
+        # 4. Duplicate guard.
         decision = self.duplicate_guard.evaluate(business_operation_id)
         self.ledger.append(
             build_event(
@@ -293,41 +256,25 @@ class DispatchCoordinator:
                 )
             )
 
-        # 6. Create dispatch attempt.
+        # 6. Create dispatch attempt ID.
         dispatch_attempt_id = new_dispatch_attempt_id()
-        self.attempts.create(
-            dispatch_attempt_id=dispatch_attempt_id,
-            business_operation_id=business_operation_id,
-            release_id=release.payload.release_id,
-            release_epoch=release.payload.release_epoch,
-            idempotency_key=idempotency_key,
-            state=OperationState.DISPATCH_ATTEMPTED,
-            now=self.clock.now(),
-        )
-        self.ledger.append(
-            build_event(
-                event_type=EvidenceEventType.DISPATCH_ATTEMPTED,
-                evidence_source="dispatch-coordinator",
-                timestamp=self.clock.now(),
-                business_operation_id=business_operation_id,
-                release=release.payload,
-                dispatch_attempt_id=dispatch_attempt_id,
-                idempotency_key=idempotency_key,
-                authority_state=op.authority_state,
-                previous_state=OperationState.ADMISSIBILITY_ALLOWED,
-                new_state=OperationState.DISPATCH_ATTEMPTED,
-                correlation_id=correlation_id,
-            )
-        )
 
         # 7. Atomic consumption.
         consumed = self.consumption.try_consume(
             release.payload.release_id, dispatch_attempt_id, self.clock.now()
         )
         if not consumed:
-            self.attempts.update(
-                dispatch_attempt_id, self.clock.now(), state=OperationState.DISPATCH_REJECTED
+            self.attempts.create(
+                dispatch_attempt_id=dispatch_attempt_id,
+                business_operation_id=business_operation_id,
+                release_id=release.payload.release_id,
+                release_epoch=release.payload.release_epoch,
+                idempotency_key=idempotency_key,
+                state=OperationState.DISPATCH_REJECTED,
+                now=self.clock.now(),
             )
+            # We do NOT log DISPATCH_ATTEMPTED. The release was never consumed, 
+            # so no real dispatch attempt occurred.
             self.ledger.append(
                 build_event(
                     event_type=EvidenceEventType.RELEASE_REPLAY_ATTEMPTED,
@@ -349,12 +296,21 @@ class DispatchCoordinator:
                 dispatch_attempt_id=dispatch_attempt_id,
                 release_id=release.payload.release_id,
                 release_epoch=release.payload.release_epoch,
-                operation_state=OperationState.DISPATCH_REJECTED,
+                operation_state=OperationState.ADMISSIBILITY_ALLOWED,
                 response_class=None,
                 reason="release_already_consumed",
             )
 
         # 8. Post-consumption transitions.
+        self.attempts.create(
+            dispatch_attempt_id=dispatch_attempt_id,
+            business_operation_id=business_operation_id,
+            release_id=release.payload.release_id,
+            release_epoch=release.payload.release_epoch,
+            idempotency_key=idempotency_key,
+            state=OperationState.DISPATCH_ATTEMPTED,
+            now=self.clock.now(),
+        )
         self.ledger.append(
             build_event(
                 event_type=EvidenceEventType.RELEASE_CONSUMED,
@@ -367,6 +323,21 @@ class DispatchCoordinator:
                 authority_state=op.authority_state,
                 previous_state=OperationState.ADMISSIBILITY_ALLOWED,
                 new_state=OperationState.RELEASE_CONSUMED,
+                correlation_id=correlation_id,
+            )
+        )
+        self.ledger.append(
+            build_event(
+                event_type=EvidenceEventType.DISPATCH_ATTEMPTED,
+                evidence_source="dispatch-coordinator",
+                timestamp=self.clock.now(),
+                business_operation_id=business_operation_id,
+                release=release.payload,
+                dispatch_attempt_id=dispatch_attempt_id,
+                idempotency_key=idempotency_key,
+                authority_state=op.authority_state,
+                previous_state=OperationState.RELEASE_CONSUMED,
+                new_state=OperationState.DISPATCH_ATTEMPTED,
                 correlation_id=correlation_id,
             )
         )
