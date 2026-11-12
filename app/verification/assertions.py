@@ -91,29 +91,39 @@ def assert_release_consumed_before_dispatch_attempted(events: Sequence[EvidenceE
 # --- cancellation / completion evidence ---------------------------------
 
 
-def assert_cancellation_ack_not_treated_as_confirmed(events: Sequence[EvidenceEvent]) -> Optional[str]:
-    """Ensure CANCELLATION_CONFIRMED is backed by explicit terminal status, not just ACK."""
+def assert_cancellation_confirmed_has_terminal_evidence(events: Sequence[EvidenceEvent]) -> Optional[str]:
+    """Ensure CANCELLATION_CONFIRMED is backed by explicit terminal status and a
+    correlated prior REQUESTED/ACKNOWLEDGED event in the same operation."""
     for i, e in enumerate(events):
         if e.event_type is EvidenceEventType.CANCELLATION_CONFIRMED:
             if e.receiver_response_class != ReceiverResponseClass.STATUS_TERMINAL_CANCELLED:
                 return f"CANCELLATION_CONFIRMED event {e.event_id} lacks STATUS_TERMINAL_CANCELLED"
             if not e.receiver_refund_reference:
                 return f"CANCELLATION_CONFIRMED event {e.event_id} missing receiver_refund_reference"
-            
+
             found_prior = False
             for j in range(i - 1, -1, -1):
                 prior = events[j]
+                # Skip events from other operations rather than failing.
+                # The ledger may contain multiple operations; the assertion
+                # only cares about events within THIS operation.
                 if prior.business_operation_id != e.business_operation_id:
-                    return f"CANCELLATION_CONFIRMED for {e.receiver_refund_reference} belongs to different operation"
+                    continue
                 if prior.receiver_refund_reference == e.receiver_refund_reference and \
-                   prior.event_type in (EvidenceEventType.CANCELLATION_REQUESTED, EvidenceEventType.CANCELLATION_ACKNOWLEDGED):
+                   prior.event_type in (
+                       EvidenceEventType.CANCELLATION_REQUESTED,
+                       EvidenceEventType.CANCELLATION_ACKNOWLEDGED,
+                   ):
                     if e.dispatch_attempt_id and prior.dispatch_attempt_id:
                         if e.dispatch_attempt_id != prior.dispatch_attempt_id:
                             continue
                     found_prior = True
                     break
             if not found_prior:
-                return f"CANCELLATION_CONFIRMED for {e.receiver_refund_reference} lacks prior REQUESTED/ACKNOWLEDGED"
+                return (
+                    f"CANCELLATION_CONFIRMED for {e.receiver_refund_reference} "
+                    f"lacks prior REQUESTED/ACKNOWLEDGED"
+                )
     return None
 
 
@@ -139,18 +149,49 @@ def assert_dispatch_rejected_has_valid_response(events: Sequence[EvidenceEvent])
 # --- retry history ------------------------------------------------------
 
 
+_UNSAFE_RETRY_STATES = (
+    "IN_FLIGHT",
+    "OUTCOME_UNKNOWN",
+    "COMPLETION_CONFIRMED",
+    "CANCELLATION_ACKNOWLEDGED",
+    "DISPATCH_ACCEPTED",
+)
+
+
 def assert_retries_justified(events: Sequence[EvidenceEvent]) -> Optional[str]:
-    """Ensure no retry occurs after an unsafe/terminal state, and enforce fresh releases on retry."""
-    last_outcome = None
-    last_release_id = None
+    """Ensure no retry occurs after an unsafe/terminal state.
+
+    Unsafe prior states:
+      * IN_FLIGHT
+      * OUTCOME_UNKNOWN
+      * COMPLETION_CONFIRMED
+      * CANCELLATION_ACKNOWLEDGED (a cancelled-but-not-confirmed attempt)
+      * DISPATCH_ACCEPTED (the refund exists at the receiver)
+
+    Reset points:
+      * CANCELLATION_CONFIRMED (terminal cancellation resolves the pending state)
+
+    A retry after DISPATCH_REJECTED must use a fresh release_id.
+    """
+    last_outcome: Optional[str] = None
+    last_release_id: Optional[str] = None
 
     for e in events:
         if e.event_type is EvidenceEventType.DISPATCH_ATTEMPTED:
-            if last_outcome in ("IN_FLIGHT", "OUTCOME_UNKNOWN", "COMPLETION_CONFIRMED", "CANCELLATION_ACKNOWLEDGED"):
+            if last_outcome in _UNSAFE_RETRY_STATES:
                 return f"retry attempted after unsafe state {last_outcome}"
             if last_outcome == "DISPATCH_REJECTED":
                 if e.release_id == last_release_id:
-                    return f"retry attempted with same release {e.release_id} after rejection"
+                    return (
+                        f"retry attempted with same release {e.release_id} after rejection"
+                    )
+
+        # Reset point: CANCELLATION_CONFIRMED clears the unsafe state so a
+        # genuinely new authorization can proceed.
+        if e.event_type is EvidenceEventType.CANCELLATION_CONFIRMED:
+            last_outcome = None
+            last_release_id = None
+            continue
 
         if e.event_type in (
             EvidenceEventType.DISPATCH_REJECTED,
@@ -175,7 +216,7 @@ ALL_ASSERTIONS = (
     ("ascending_timestamps", lambda evs, ctx: assert_events_have_ascending_timestamps(evs)),
     ("release_verified_before_dispatch", lambda evs, ctx: assert_release_verified_before_dispatch(evs)),
     ("release_consumed_before_dispatch_attempted", lambda evs, ctx: assert_release_consumed_before_dispatch_attempted(evs)),
-    ("cancellation_confirmed_has_terminal_cancelled", lambda evs, ctx: assert_cancellation_ack_not_treated_as_confirmed(evs)),
+    ("cancellation_confirmed_has_terminal_evidence", lambda evs, ctx: assert_cancellation_confirmed_has_terminal_evidence(evs)),
     ("completion_confirmed_has_terminal_completed", lambda evs, ctx: assert_completion_confirmed_has_terminal_completed(evs)),
     ("dispatch_rejected_has_valid_response", lambda evs, ctx: assert_dispatch_rejected_has_valid_response(evs)),
     ("retries_justified", lambda evs, ctx: assert_retries_justified(evs)),
